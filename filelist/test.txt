@@ -1,0 +1,15 @@
+./dataset\jvs_ver2_1\jvs001\parallel100\wav24kHz16bit\VOICEACTRESS100_033.wav
+./dataset\jvs_ver2_1\jvs001\falset10\wav24kHz16bit\VOICEACTRESS100_004.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_006.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_076.wav
+./dataset\jvs_ver2_1\jvs001\nonpara30\wav24kHz16bit\BASIC5000_1866.wav
+./dataset\jvs_ver2_1\jvs002\nonpara30\wav24kHz16bit\BASIC5000_1915.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_025.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_100.wav
+./dataset\jvs_ver2_1\jvs002\falset10\wav24kHz16bit\VOICEACTRESS100_005.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_074.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_044.wav
+./dataset\jvs_ver2_1\jvs001\nonpara30\wav24kHz16bit\BASIC5000_1818.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_032.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_061.wav
+./dataset\jvs_ver2_1\jvs002\parallel100\wav24kHz16bit\VOICEACTRESS100_020.wav
