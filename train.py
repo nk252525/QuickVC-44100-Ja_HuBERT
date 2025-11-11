@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import json
 import argparse
 import itertools
@@ -41,17 +43,65 @@ torch.backends.cudnn.benchmark = True
 global_step = 0
 
 
+def _generate_gurafu_plots(logdir: str, logger=None):
+  """tools/plot_training_summary.py を呼び出して gurafu へPNGを出力する。
+
+  Args:
+    logdir: train.log が存在する logs/<model_name> のディレクトリ。
+  """
+  # スクリプトの絶対パスを解決
+  repo_root = os.path.dirname(os.path.abspath(__file__))
+  script_path = os.path.join(repo_root, "tools", "plot_training_summary.py")
+  if not os.path.isfile(script_path):
+    raise FileNotFoundError(f"plot script not found: {script_path}")
+
+  # 同じ Python 実行ファイルで呼ぶ
+  py = sys.executable or "python"
+  cmd = [py, script_path, "--logdir", logdir, "--use-gurafu"]
+
+  if logger is not None:
+    logger.info(f"[gurafu] 生成コマンド実行: {' '.join(cmd)}")
+
+  # 出力を取り込み、ログに流す（失敗時は例外）
+  res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+  if res.stdout:
+    for line in res.stdout.strip().splitlines():
+      if logger is not None:
+        logger.info(f"[gurafu] {line}")
+      else:
+        print(f"[gurafu] {line}")
+  if res.stderr:
+    # matplotlib のフォント警告等は stderr に出ることがあるため、参考として出すだけ
+    if logger is not None:
+      logger.info(f"[gurafu][stderr] {res.stderr.strip()}")
+    else:
+      print(f"[gurafu][stderr] {res.stderr.strip()}")
+
+
 def main():
   """Assume Single Node Multi GPUs Training Only"""
-  assert torch.cuda.is_available(), "CPU training is not allowed."
+  hps = utils.get_hparams()
+  # CUDA がない場合でも --allow-cpu 指定時は継続
+  if not torch.cuda.is_available() and not getattr(hps, 'allow_cpu', False):
+    import sys, platform  # os はグローバル import 済み。ここで再インポートするとローカル変数化して UnboundLocalError の原因になる。
+    print("[GPU DEBUG] torch.__version__:", torch.__version__)
+    print("[GPU DEBUG] torch.version.cuda:", torch.version.cuda)
+    print("[GPU DEBUG] torch.cuda.is_available():", torch.cuda.is_available())
+    print("[GPU DEBUG] torch.cuda.device_count():", torch.cuda.device_count())
+    print("[GPU DEBUG] sys.executable:", sys.executable)
+    print("[GPU DEBUG] platform.platform():", platform.platform())
+    print("[GPU DEBUG] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("[GPU DEBUG] PATH (first 5 entries):", os.environ.get("PATH", "").split(os.pathsep)[:5])
+    print("[GPU DEBUG] 環境がGPUを認識していません。--allow-cpu を付けるか、正しいconda環境とnvidiaドライバを確認してください。")
+    raise AssertionError("CPU training is not allowed. Use a CUDA-enabled GPU or pass --allow-cpu for debugging.")
 
-  n_gpus = torch.cuda.device_count()
+  n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
   os.environ['MASTER_ADDR'] = 'localhost'
   os.environ['MASTER_PORT'] = '65520'
 #   n_gpus = 1
 
-  hps = utils.get_hparams()
-  run(0,1,hps)
+  # 単一GPUでの学習をデフォルトに実行（DDPは必要時のみ有効化）
+  run(0, n_gpus if n_gpus > 0 else 1, hps)
   #mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
 
 
@@ -64,9 +114,20 @@ def run(rank, n_gpus, hps):
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  # Windows では NCCL が非対応のため、複数GPU時のみ分散を初期化し、
+  # バックエンドは OS に応じて選択する（Windows: gloo、Linux: nccl）。
+  use_ddp = (n_gpus > 1)
+  if use_ddp:
+    import platform
+    backend = 'nccl' if platform.system() != 'Windows' else 'gloo'
+    dist.init_process_group(backend=backend, init_method='env://', world_size=n_gpus, rank=rank)
   torch.manual_seed(hps.train.seed)
-  torch.cuda.set_device(rank)
+  # device 選択
+  if torch.cuda.is_available():
+    device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(rank)
+  else:
+    device = torch.device('cpu')
 
 
   train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps)
@@ -74,23 +135,23 @@ def run(rank, n_gpus, hps):
       train_dataset,
       hps.train.batch_size,
       [32,40,50,60,70,80,90,100,110,120,160,200,230,260,300,350,400,450,500,600,700,800,900,1000],
-      num_replicas=n_gpus,
-      rank=rank,
+    num_replicas=(n_gpus if use_ddp else 1),
+    rank=(rank if use_ddp else 0),
       shuffle=True)
   collate_fn = TextAudioSpeakerCollate(hps)
-  train_loader = DataLoader(train_dataset, num_workers=24, shuffle=False, pin_memory=True,
+  train_loader = DataLoader(train_dataset, num_workers=24, shuffle=False, pin_memory=torch.cuda.is_available(),
       collate_fn=collate_fn, batch_sampler=train_sampler)
   if rank == 0:
     eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps)
     eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=True,
-        batch_size=1, pin_memory=False,
+        batch_size=1, pin_memory=torch.cuda.is_available(),
         drop_last=False)
   
   net_g = SynthesizerTrn(
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
-      **hps.model).cuda(rank)
-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+      **hps.model).to(device)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).to(device)
   optim_g = torch.optim.AdamW(
       net_g.parameters(), 
       hps.train.learning_rate, 
@@ -101,8 +162,9 @@ def run(rank, n_gpus, hps):
       hps.train.learning_rate, 
       betas=hps.train.betas, 
       eps=hps.train.eps)
-  net_g = DDP(net_g, device_ids=[rank])
-  net_d = DDP(net_d, device_ids=[rank])
+  if use_ddp:
+    net_g = DDP(net_g, device_ids=[rank])
+    net_d = DDP(net_d, device_ids=[rank])
 
   try:
     _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
@@ -138,6 +200,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
   train_loader, eval_loader = loaders
+  # 使用デバイスをモデルから取得
+  device = next(net_g.parameters()).device
   if writers is not None:
     writer, writer_eval = writers
   #tmp=0
@@ -150,11 +214,11 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   for batch_idx, (c, spec, y, f0, uv) in enumerate(train_loader):
     g = None
 
-    spec  = spec  .cuda(rank, non_blocking=True)
-    y     = y     .cuda(rank, non_blocking=True)
-    c     = c     .cuda(rank, non_blocking=True)
-    f0    = f0    .cuda(rank, non_blocking=True)
-    uv    = uv    .cuda(rank, non_blocking=True)
+    spec  = spec.to(device, non_blocking=torch.cuda.is_available())
+    y     = y.to(device, non_blocking=torch.cuda.is_available())
+    c     = c.to(device, non_blocking=torch.cuda.is_available())
+    f0    = f0.to(device, non_blocking=torch.cuda.is_available())
+    uv    = uv.to(device, non_blocking=torch.cuda.is_available())
 
     
     mel = spec_to_mel_torch(
@@ -219,6 +283,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         loss_gen, losses_gen = generator_loss(y_d_hat_g)
         
         if hps.model.mb_istft_vits == True:
+          # PQMF は CPU/GPU いずれでも動作するよう device を解決済
           pqmf = PQMF(y.device)
           y_mb = pqmf.analysis(y)
           loss_subband = subband_stft_loss(hps, y_mb, y_hat_mb)
@@ -270,6 +335,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   
   if rank == 0:
     logger.info('====> Epoch: {}'.format(epoch))
+    # エポック終了ごとにグラフを自動生成して gurafu へ出力
+    try:
+      _generate_gurafu_plots(hps.model_dir, logger)
+    except Exception as e:
+      if logger is not None:
+        logger.warning(f"[gurafu] グラフ生成に失敗しました: {e}")
+      else:
+        print(f"[gurafu] グラフ生成に失敗しました: {e}")
   #print(tmp,tmp1)
     
 
@@ -279,11 +352,12 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     with torch.no_grad():
       for batch_idx,  (c, spec, y, f0, uv) in enumerate(eval_loader):
         g = None
-        spec= spec[:1].cuda(0)
-        y = y[:1].cuda(0)
-        c = c[:1].cuda(0)
-        f0 = f0[:1].cuda(0)
-        uv = uv[:1].cuda(0)
+        device = next(generator.parameters()).device
+        spec= spec[:1].to(device)
+        y = y[:1].to(device)
+        c = c[:1].to(device)
+        f0 = f0[:1].to(device)
+        uv = uv[:1].to(device)
 
         break
       mel = spec_to_mel_torch(
@@ -295,7 +369,9 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         hps.data.mel_fmax)
       #y_hat, y_hat_mb, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
       #y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
-      y_hat = generator.module.infer(c, g=g, mel=mel, f0=f0)
+      # DDP の有無で module の有無が変わるため、動的に取得
+      gen_mod = getattr(generator, 'module', generator)
+      y_hat = gen_mod.infer(c, g=g, mel=mel, f0=f0)
       mel = spec_to_mel_torch(
           spec, 
           hps.data.filter_length, 

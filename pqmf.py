@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from scipy.signal import kaiser
+from scipy.signal.windows import kaiser
 
 
 def design_prototype_filter(taps=62, cutoff_ratio=0.15, beta=9.0):
@@ -74,16 +74,28 @@ class PQMF(torch.nn.Module):
                 (np.arange(taps + 1) - ((taps - 1) / 2)) -
                 (-1) ** k * np.pi / 4)
 
-        # convert to tensor
-        analysis_filter = torch.from_numpy(h_analysis).float().unsqueeze(1).cuda(device)
-        synthesis_filter = torch.from_numpy(h_synthesis).float().unsqueeze(0).cuda(device)
+        # 正規化したデバイス指定を作成（Tensor/torch.device/int/str に対応）
+        if isinstance(device, torch.Tensor):
+            dev = device.device
+        elif isinstance(device, torch.device):
+            dev = device
+        elif isinstance(device, int):
+            dev = torch.device(f'cuda:{device}') if torch.cuda.is_available() else torch.device('cpu')
+        elif isinstance(device, str):
+            dev = torch.device(device)
+        else:
+            dev = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+        # convert to tensor（.to(dev) でCPU/GPUを安全に切替）
+        analysis_filter = torch.from_numpy(h_analysis).float().unsqueeze(1).to(dev)
+        synthesis_filter = torch.from_numpy(h_synthesis).float().unsqueeze(0).to(dev)
 
         # register coefficients as beffer
         self.register_buffer("analysis_filter", analysis_filter)
         self.register_buffer("synthesis_filter", synthesis_filter)
 
         # filter for downsampling & upsampling
-        updown_filter = torch.zeros((subbands, subbands, subbands)).float().cuda(device)
+        updown_filter = torch.zeros((subbands, subbands, subbands)).float().to(dev)
         for k in range(subbands):
             updown_filter[k, k, 0] = 1.0
         self.register_buffer("updown_filter", updown_filter)

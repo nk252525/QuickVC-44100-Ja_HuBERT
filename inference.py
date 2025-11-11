@@ -21,6 +21,22 @@ import pyworld
 import soundfile as sf
 
 
+def _assert_config_ckpt_pair(args):
+    """Warn if config and model_path are from different log dirs."""
+    cfg_dir = os.path.dirname(os.path.abspath(args.config))
+    ckpt_dir = os.path.dirname(os.path.abspath(args.model_path))
+    if os.path.basename(cfg_dir) != os.path.basename(ckpt_dir):
+        print(f"[WARN] config と model_path のフォルダ名が一致しません: {os.path.basename(cfg_dir)} vs {os.path.basename(ckpt_dir)}")
+        print("       学習時と異なる設定/重みの組み合わせは無音/ノイズの原因になります。")
+
+
+def _resample_if_needed(y, sr_in, sr_target):
+    if sr_in == sr_target:
+        return y, sr_in
+    y2 = librosa.resample(y, orig_sr=sr_in, target_sr=sr_target)
+    return y2.astype('float32'), sr_target
+
+
 def inference(args):
     
     # Set counter 
@@ -31,20 +47,21 @@ def inference(args):
         print("Enter the device number to use.")
         key = input("GPU:0, CPU:1 ===> ")
         if key == "0":
-            device="cuda:0"
+            device = torch.device("cuda:0")
         elif key=="1":
-            device="cpu"
+            device = torch.device("cpu")
         print(f"Device : {device}")
     else:
         print(f"CUDA is not available. Device : cpu")
-        device = "cpu"
+        device = torch.device("cpu")
     
     # play audio by system default
     speaker = sc.get_speaker(sc.default_speaker().name)
 
     # Load config
-    hps = utils.get_hparams_from_file(args.hpfile)
+    hps = utils.get_hparams_from_file(args.config)
     os.makedirs(args.outdir, exist_ok=True)
+    _assert_config_ckpt_pair(args)
 
     # Init Generator
     net_g = SynthesizerTrn(
@@ -52,10 +69,14 @@ def inference(args):
         hps.train.segment_size // hps.data.hop_length,
         **hps.model).to(device)
     _ = net_g.eval()
-    print("Loadied generator model.")
+    print("Loaded generator model.")
     total = sum([param.nelement() for param in net_g.parameters()])
-    _ = utils.load_checkpoint(args.ptfile, net_g, None)
-    print("Loadied checkpoint...")
+    # Load checkpoint and report iteration
+    _, _, _, iteration = utils.load_checkpoint(args.model_path, net_g, None)
+    print(f"Loaded checkpoint: {args.model_path} (iteration={iteration})")
+    if iteration <= 0:
+        print("[WARN] このチェックポイントは学習直後 (iteration=0) です。出力がノイズになる可能性が高いです。")
+        print("       学習を継続し、より大きい G_*.pth を使用してください (例: G_10000.pth)。")
     
     # Select hubert model
     if args.hubert == "japanese-hubert-base":
@@ -72,19 +93,27 @@ def inference(args):
         # Load Target Speech
         target_wavpath = input("Enter the target speech wavpath ==> ")
         y_tgt,  sr_tgt = sf.read(target_wavpath)
+        # 強制モノラル化
+        if hasattr(y_tgt, 'ndim') and y_tgt.ndim == 2:
+            y_tgt = y_tgt.mean(axis=1)
         y_tgt = y_tgt.astype(np.float32)
         print("Loaded the target speech. :",target_wavpath)
         if sr_tgt != hps.data.sampling_rate:
             y_tgt = librosa.resample(y_tgt, orig_sr=sr_tgt, target_sr=hps.data.sampling_rate)
+            sr_tgt = hps.data.sampling_rate
             print(f"Detect {sr_tgt} Hz. Target speech is resampled to {hps.data.sampling_rate} Hz.")
 
         # Load Source Speech
         source_wavpath = input("Enter the source speech wavpath ==> ")
         y_src,  sr_src = sf.read(source_wavpath)
+        # 強制モノラル化
+        if hasattr(y_src, 'ndim') and y_src.ndim == 2:
+            y_src = y_src.mean(axis=1)
         y_src = y_src.astype(np.float32)
         print("Loaded the target speech. :",source_wavpath)
         if sr_src != hps.data.sampling_rate:
             y_src = librosa.resample(y_src, orig_sr=sr_src, target_sr=hps.data.sampling_rate)
+            sr_src = hps.data.sampling_rate
             print(f"Detect {sr_src} Hz. Source speech is resampled to {hps.data.sampling_rate} Hz.")
 
         # Select F0 method.
@@ -107,8 +136,9 @@ def inference(args):
             f0_method = "crepe"
             print("Set up calculation of F0 by crepe")
 
-        # Synchronize CUDA
-        torch.cuda.synchronize()
+        # Synchronize CUDA (GPU使用時のみ)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         time_S = time.time()
 
         # Start Voice Convertion
@@ -132,22 +162,57 @@ def inference(args):
 
             # Calculate source content embeddings.
             time_S_HuBERT= time.time()
-            wav_src = torch.from_numpy(y_src).unsqueeze(0).to(device)
+            # HuBERT は 16kHz 前提のため、別途 16k に変換して特徴抽出
+            y_src_16k, _ = _resample_if_needed(y_src, sr_src, 16000)
+            wav_src_16k = torch.from_numpy(y_src_16k).unsqueeze(0).to(device)
             if args.hubert == "japanese-hubert-base":
-                c = hubert_model(wav_src)[0].squeeze()        # [Frame, Hidden]
+                # HF HubERT: (B, T, H) -> (T, H)
+                c = hubert_model(wav_src_16k)[0].squeeze(0)  # last_hidden_state
             else:
-                c = hubert_model.units(wav_src)
-                c=c.transpose(2,1)
+                # hubert_soft の出力は実装によって (B, C, T) or (B, T, C)
+                c = hubert_model.units(wav_src_16k)
+                if c.dim() == 3:
+                    B, D1, D2 = c.shape
+                    if D1 > D2:
+                        # (B, T, C)
+                        c = c[0]                 # (T, C)
+                    else:
+                        # (B, C, T)
+                        c = c[0].transpose(0,1) # (T, C)
+                elif c.dim() == 2:
+                    # (T, C) 想定
+                    pass
+                else:
+                    raise RuntimeError(f"Unexpected hubert_soft units shape: {c.shape}")
+
+            # (T, C) -> (C, T) -> repeat to mel length -> (1, C, T)
             c = utils.repeat_expand_2d(c.transpose(1,0), length).unsqueeze(0)
             time_E_HuBERT= time.time()
 
             # Calculate F0.
             time_S_F0= time.time()
+            hop = hps.data.hop_length
+            sr_for_f0 = hps.data.sampling_rate  # 学習時と同一にそろえる
             if f0_method=="crepe":
-                f0, vuv = f0_function(y_tgt, sampling_rate=sr_tgt, hop_length=512)        
+                f0, vuv = f0_function(y_tgt, sampling_rate=sr_for_f0, hop_length=hop)
+                # f0 は p_len に合わせて後段で調整済
             else:
-                f0 = f0_function(y_tgt, sampling_rate=sr_tgt, hop_length=512)        
-            f0 = torch.from_numpy(f0).unsqueeze(0).to(device)               # [Batch, Frame]
+                # 可能な関数には p_len を渡して長さを mel に合わせる
+                if f0_function in [compute_f0_parselmouth, compute_f0_harvest, compute_f0_dio]:
+                    f0 = f0_function(y_tgt, p_len=length, sampling_rate=sr_for_f0, hop_length=hop)
+                else:
+                    f0 = f0_function(y_tgt, sampling_rate=sr_for_f0, hop_length=hop)
+
+            # 長さ調整（mel とフレーム一致にする）
+            if isinstance(f0, tuple):
+                f0 = f0[0]
+            if len(f0) != length:
+                # 補間で length に合わせる
+                import numpy as _np
+                x = _np.arange(len(f0))
+                xp = _np.linspace(0, len(f0)-1, num=length)
+                f0 = _np.interp(xp, x, f0)
+            f0 = torch.from_numpy(f0.astype('float32')).unsqueeze(0).to(device)  # [B, T]
             time_E_F0= time.time()
 
             # Infer
@@ -156,8 +221,9 @@ def inference(args):
             audio = audio[0][0].data.cpu().float().numpy()
             time_E_infer= time.time()
 
-        # Synchronize CUDA
-        torch.cuda.synchronize()
+        # Synchronize CUDA (GPU使用時のみ)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         time_E = time.time()
 
         # Print time infomation
@@ -684,7 +750,10 @@ if __name__ == "__main__":
                         type=str, 
                         required=True,
                         default="./path/to/G_xxx.pth", 
-                        help="path to pth file")
+                        help="path to pth file or logs/<model> directory")
+    parser.add_argument("--latest", 
+                        action="store_true",
+                        help="When set, pick the latest G_*.pth from the given model_path directory (or its dir if a file is provided)")
     
     parser.add_argument("--hubert", 
                         type=str, 
@@ -698,6 +767,16 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
+    # Resolve latest checkpoint if requested or directory is passed
+    mp = args.model_path
+    if args.latest or os.path.isdir(mp):
+        model_dir = mp if os.path.isdir(mp) else os.path.dirname(mp)
+        try:
+            from utils import latest_checkpoint_path
+            args.model_path = latest_checkpoint_path(model_dir, "G_*.pth")
+            print(f"[INFO] Using latest checkpoint: {args.model_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to locate latest checkpoint in {model_dir}: {e}")
     # start
     inference(args)
 ################################################################

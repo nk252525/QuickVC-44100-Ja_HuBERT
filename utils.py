@@ -124,8 +124,10 @@ def plot_spectrogram_to_numpy(spectrogram):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  # Matplotlib 3.9+ では tostring_rgb が存在しない環境があるため buffer_rgba を使用
+  w, h = fig.canvas.get_width_height()
+  buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+  data = buf.reshape(h, w, 4)[:, :, :3].copy()  # drop alpha
   plt.close()
   return data
 
@@ -153,8 +155,9 @@ def plot_alignment_to_numpy(alignment, info=None):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  w, h = fig.canvas.get_width_height()
+  buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+  data = buf.reshape(h, w, 4)[:, :, :3].copy()
   plt.close()
   return data
 
@@ -164,12 +167,17 @@ def load_wav_to_torch(full_path):
   return torch.FloatTensor(data.astype(np.float32)), sampling_rate
 """
 import soundfile as sf
+import warnings
+try:
+  import librosa as _librosa
+except Exception:
+  _librosa = None
 def load_wav_to_torch(full_path):
-  sampling_rate, wav = read(full_path.replace("\\", "/")) ### modify .replace("\\", "/") ###
-  #sampling_rate, wav = sf.read(full_path.replace("\\", "/")) ### modify .replace("\\", "/") ###
-  
-  if len(wav.shape) == 2:
+  sampling_rate, wav = read(full_path.replace("\\", "/"))  # wav is numpy array
+  # 強制モノラル化
+  if wav.ndim == 2:
       wav = wav[:, 0]
+  # 量子化ビット深度に応じて [-1,1] へ正規化
   if wav.dtype == np.int16:
       wav = wav / 32768.0
   elif wav.dtype == np.int32:
@@ -177,10 +185,16 @@ def load_wav_to_torch(full_path):
   elif wav.dtype == np.uint8:
       wav = (wav - 128) / 128.0
   wav = wav.astype(np.float32)
-  
+
+  # サンプリングレートが 44100 でない場合はリサンプル（学習は 44.1k 前提）
   if sampling_rate != 44100:
-    print("ERROR SAMPLINGRATE")
-    pass
+    if _librosa is None:
+      warnings.warn(f"[utils] {full_path} sr={sampling_rate} を 44100 に変換したいが librosa が見つかりません。学習前に44100Hzへ変換してください。")
+    else:
+      wav = _librosa.resample(wav, orig_sr=sampling_rate, target_sr=44100)
+      sampling_rate = 44100
+      # レベルの安全のためクリッピング
+      wav = np.clip(wav, -1.0, 1.0)
   return torch.FloatTensor(wav), sampling_rate
 
 def load_filepaths_and_text(filename, split="|"):
@@ -195,6 +209,8 @@ def get_hparams(init=True):
                       help='JSON file for configuration')
   parser.add_argument('-m', '--model', type=str,default="QuickVC_Ja",
                       help='Model name')
+  parser.add_argument('--allow-cpu', action='store_true', default=False,
+                      help='Allow CPU training (very slow, for debugging)')
   
   args = parser.parse_args()
   model_dir = os.path.join("./logs", args.model)
@@ -216,6 +232,8 @@ def get_hparams(init=True):
   
   hparams = HParams(**config)
   hparams.model_dir = model_dir
+  # 追加CLI引数をhparamsへ付与
+  hparams.allow_cpu = args.allow_cpu
   return hparams
 
 def transform(mel, height): # 68-92
